@@ -1,0 +1,245 @@
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+
+using namespace std;
+using namespace ns3;
+
+void RunExperiment(string rate)
+{
+    cout << "\n===== Bottleneck: " << rate << " Mbps =====" << endl;
+
+    // 1. Create six nodes
+    NodeContainer nodes;
+    nodes.Create(6);
+
+    Ptr<Node> n0 = nodes.Get(0);
+    Ptr<Node> n1 = nodes.Get(1);
+    Ptr<Node> n2 = nodes.Get(2);
+    Ptr<Node> n3 = nodes.Get(3);
+    Ptr<Node> r1 = nodes.Get(4);
+    Ptr<Node> r2 = nodes.Get(5);
+
+    // 2. Configure access links
+    PointToPointHelper access;
+    access.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
+    access.SetChannelAttribute("Delay", StringValue("2ms"));
+    access.SetQueue("ns3::DropTailQueue<Packet>",
+                    "MaxSize", StringValue("50p"));
+
+    // 3. Configure bottleneck link
+    PointToPointHelper bottleneck;
+    bottleneck.SetDeviceAttribute(
+        "DataRate", StringValue(rate + "Mbps"));
+
+    bottleneck.SetChannelAttribute(
+        "Delay", StringValue("10ms"));
+
+    bottleneck.SetQueue("ns3::DropTailQueue<Packet>",
+                        "MaxSize", StringValue("50p"));
+
+    // 4. Connect nodes
+    NetDeviceContainer d0 = access.Install(n0, r1);
+    NetDeviceContainer d1 = access.Install(n1, r1);
+    NetDeviceContainer db = bottleneck.Install(r1, r2);
+    NetDeviceContainer d2 = access.Install(r2, n3);
+    NetDeviceContainer d3 = access.Install(r2, n2);
+
+    // 5. Enable PCAP tracing
+    access.EnablePcapAll("access");
+    bottleneck.EnablePcapAll("bottleneck");
+
+    // 6. Install Internet Stack
+    InternetStackHelper stack;
+    stack.Install(nodes);
+
+    // 7. Assign IP addresses
+    Ipv4AddressHelper address;
+
+    address.SetBase("10.1.1.0", "255.255.255.0");
+    address.Assign(d0);
+
+    address.SetBase("10.1.2.0", "255.255.255.0");
+    address.Assign(d1);
+
+    address.SetBase("10.1.3.0", "255.255.255.0");
+    address.Assign(db);
+
+    address.SetBase("10.1.4.0", "255.255.255.0");
+    Ipv4InterfaceContainer tcpInterfaces =
+        address.Assign(d2);
+
+    address.SetBase("10.1.5.0", "255.255.255.0");
+    Ipv4InterfaceContainer udpInterfaces =
+        address.Assign(d3);
+
+    // 8. Configure routing
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // 9. TCP receiver on n3
+    uint16_t tcpPort = 5000;
+
+    PacketSinkHelper tcpSink(
+        "ns3::TcpSocketFactory",
+        InetSocketAddress(Ipv4Address::GetAny(), tcpPort));
+
+    ApplicationContainer tcpSinkApps =
+        tcpSink.Install(n3);
+
+    tcpSinkApps.Start(Seconds(0.0));
+    tcpSinkApps.Stop(Seconds(20.0));
+
+    // 10. TCP sender on n0
+    BulkSendHelper tcpSource(
+        "ns3::TcpSocketFactory",
+        InetSocketAddress(tcpInterfaces.GetAddress(1),
+                          tcpPort));
+
+    tcpSource.SetAttribute("SendSize",
+                           UintegerValue(1024));
+    tcpSource.SetAttribute("MaxBytes",
+                           UintegerValue(0));
+
+    ApplicationContainer tcpApps =
+        tcpSource.Install(n0);
+
+    tcpApps.Start(Seconds(1.0));
+    tcpApps.Stop(Seconds(19.0));
+
+    // 11. UDP receiver on n2
+    uint16_t udpPort = 6000;
+
+    PacketSinkHelper udpSink(
+        "ns3::UdpSocketFactory",
+        InetSocketAddress(Ipv4Address::GetAny(), udpPort));
+
+    ApplicationContainer udpSinkApps =
+        udpSink.Install(n2);
+
+    udpSinkApps.Start(Seconds(0.0));
+    udpSinkApps.Stop(Seconds(20.0));
+
+    // 12. UDP sender on n1
+    OnOffHelper udpSource(
+        "ns3::UdpSocketFactory",
+        InetSocketAddress(udpInterfaces.GetAddress(1),
+                          udpPort));
+
+    udpSource.SetAttribute("DataRate",
+                           StringValue("1Mbps"));
+    udpSource.SetAttribute("PacketSize",
+                           UintegerValue(512));
+
+    ApplicationContainer udpApps =
+        udpSource.Install(n1);
+
+    udpApps.Start(Seconds(1.0));
+    udpApps.Stop(Seconds(19.0));
+
+    // 13. Install FlowMonitor
+    FlowMonitorHelper monitorHelper;
+    Ptr<FlowMonitor> monitor =
+        monitorHelper.InstallAll();
+
+    // 14. Run simulation
+    Simulator::Stop(Seconds(20.0));
+    Simulator::Run();
+
+    // 15. Application received bytes
+    Ptr<PacketSink> tcpReceiver =
+        DynamicCast<PacketSink>(tcpSinkApps.Get(0));
+
+    Ptr<PacketSink> udpReceiver =
+        DynamicCast<PacketSink>(udpSinkApps.Get(0));
+
+    cout << "\nTCP received bytes: "
+         << tcpReceiver->GetTotalRx() << endl;
+
+    cout << "UDP received bytes: "
+         << udpReceiver->GetTotalRx() << endl;
+
+    // 16. Calculate performance metrics
+    monitor->CheckForLostPackets();
+
+    Ptr<Ipv4FlowClassifier> classifier =
+        DynamicCast<Ipv4FlowClassifier>(
+            monitorHelper.GetClassifier());
+
+    map<FlowId, FlowMonitor::FlowStats> stats =
+        monitor->GetFlowStats();
+
+    for (auto it = stats.begin(); it != stats.end(); ++it)
+    {
+        Ipv4FlowClassifier::FiveTuple t =
+            classifier->FindFlow(it->first);
+
+        FlowMonitor::FlowStats st = it->second;
+
+        double throughput = 0.0;
+        double avgDelay = 0.0;
+        double lossRate = 0.0;
+
+        if (st.timeLastRxPacket > st.timeFirstTxPacket)
+        {
+            double duration =
+                (st.timeLastRxPacket -
+                 st.timeFirstTxPacket).GetSeconds();
+
+            throughput =
+                st.rxBytes * 8.0 /
+                (duration * 1000000.0);
+        }
+
+        if (st.rxPackets > 0)
+        {
+            avgDelay =
+                st.delaySum.GetSeconds() /
+                st.rxPackets;
+        }
+
+        if (st.txPackets > 0)
+        {
+            lossRate =
+                100.0 * (st.txPackets - st.rxPackets) /
+                st.txPackets;
+        }
+
+        cout << "\nSource: " << t.sourceAddress
+             << " Destination: " << t.destinationAddress
+             << " Protocol: " << (int)t.protocol << endl;
+
+        cout << "Transmitted packets: "
+             << st.txPackets << endl;
+
+        cout << "Received packets: "
+             << st.rxPackets << endl;
+
+        cout << "Lost packets: "
+             << st.lostPackets << endl;
+
+        cout << "Packet loss: "
+             << lossRate << "%" << endl;
+
+        cout << "Throughput: "
+             << throughput << " Mbps" << endl;
+
+        cout << "Average delay: "
+             << avgDelay * 1000.0 << " ms" << endl;
+    }
+
+    // 17. Destroy this experiment before the next
+    Simulator::Destroy();
+}
+
+int main()
+{
+    RunExperiment("2");
+    RunExperiment("5");
+    RunExperiment("10");
+
+    return 0;
+}
